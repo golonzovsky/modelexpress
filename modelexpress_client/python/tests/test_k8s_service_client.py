@@ -19,6 +19,7 @@ from modelexpress.metadata.k8s_service_client import MxK8sServiceClient
 from modelexpress.metadata.payload import worker_tensor_descriptors
 from modelexpress.metadata.publish import _is_p2p_metadata_enabled
 from modelexpress.metadata.source_id import compute_mx_source_id
+from modelexpress.metadata.worker_server import WorkerServiceServicer
 
 
 def _base_identity() -> p2p_pb2.SourceIdentity:
@@ -441,5 +442,104 @@ def test_get_metadata_rejects_worker_rank_mismatch():
             client.get_metadata(sid, "worker-xyz")
         # max_retries=1 -> 2 attempts total.
         assert servicer.call_count == 2
+    finally:
+        server.stop(grace=None)
+
+
+# ---------------------------------------------------------------------------
+# Artifact discovery against the real WorkerServiceServicer
+# ---------------------------------------------------------------------------
+
+
+def test_get_metadata_artifact_discovery_against_real_servicer():
+    """A registered artifact mx_source_id resolves through GetTensorManifest.
+
+    Decentralized artifact discovery reuses the Service-routed
+    GetTensorManifest keyed by the artifact's own mx_source_id. The real
+    servicer must answer for registered artifact ids (instead of
+    rejecting them against the tensor source id) and the client must
+    synthesize an artifact_source payload so discover_artifact_source
+    accepts the worker.
+    """
+    weights_sid = compute_mx_source_id(_base_identity())
+    artifact_identity = _base_identity()
+    artifact_identity.mx_source_type = p2p_pb2.MX_SOURCE_TYPE_TORCH_COMPILE_CACHE
+    artifact_sid = compute_mx_source_id(artifact_identity)
+
+    servicer = WorkerServiceServicer(
+        tensor_protos=[p2p_pb2.TensorDescriptor(name="t0", size=16, device_id=0)],
+        mx_source_id=weights_sid,
+        metadata_endpoint="10.0.0.1:5555",
+        agent_name="real-agent",
+        worker_rank=0,
+        accelerator="cuda",
+    )
+    servicer.register_artifact_source(
+        artifact_sid,
+        "artifact-1",
+        p2p_pb2.ArtifactManifest(manifest_version=1),
+        artifact_chunk_manager=object(),
+    )
+    server, port = _start_fake_server(servicer)
+    try:
+        client = MxK8sServiceClient(
+            worker_rank=0,
+            service_pattern=f"127.0.0.1:{port}",
+            max_retries=0,
+            backoff_seconds=0.0,
+        )
+
+        resp = client.get_metadata(artifact_sid, "")
+        assert resp.found is True
+        assert resp.mx_source_id == artifact_sid
+        assert resp.worker.WhichOneof("source_payload") == "artifact_source"
+        assert resp.worker.worker_grpc_endpoint == f"127.0.0.1:{port}"
+        assert resp.worker.metadata_endpoint == "10.0.0.1:5555"
+        assert resp.worker.accelerator == "cuda"
+
+        # The tensor path is untouched: the weights id still serves tensors.
+        resp = client.get_metadata(weights_sid, "")
+        assert resp.worker.WhichOneof("source_payload") == "tensor_source"
+        assert len(worker_tensor_descriptors(resp.worker)) == 1
+
+        # Unregistered ids still fail closed.
+        with pytest.raises(grpc.RpcError) as excinfo:
+            client.get_metadata("0" * 16, "")
+        assert "mx_source_id mismatch" in excinfo.value.details()
+    finally:
+        server.stop(grace=None)
+
+
+def test_get_metadata_artifact_discovery_after_unregister():
+    """An unregistered artifact id goes back to failing closed."""
+    weights_sid = compute_mx_source_id(_base_identity())
+    artifact_identity = _base_identity()
+    artifact_identity.mx_source_type = p2p_pb2.MX_SOURCE_TYPE_TORCH_COMPILE_CACHE
+    artifact_sid = compute_mx_source_id(artifact_identity)
+
+    servicer = WorkerServiceServicer(
+        tensor_protos=[],
+        mx_source_id=weights_sid,
+        worker_rank=0,
+        accelerator="cuda",
+    )
+    servicer.register_artifact_source(
+        artifact_sid,
+        "artifact-1",
+        p2p_pb2.ArtifactManifest(manifest_version=1),
+        artifact_chunk_manager=object(),
+    )
+    servicer.unregister_artifact_source(artifact_sid, "artifact-1")
+    server, port = _start_fake_server(servicer)
+    try:
+        client = MxK8sServiceClient(
+            worker_rank=0,
+            service_pattern=f"127.0.0.1:{port}",
+            max_retries=0,
+            backoff_seconds=0.0,
+        )
+        with pytest.raises(grpc.RpcError) as excinfo:
+            client.get_metadata(artifact_sid, "")
+        assert "mx_source_id mismatch" in excinfo.value.details()
     finally:
         server.stop(grace=None)

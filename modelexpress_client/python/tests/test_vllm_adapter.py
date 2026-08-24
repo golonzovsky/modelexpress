@@ -553,3 +553,44 @@ class TestReadSafetensorsIndexObjectStore:
             DraftShardSelection.SELECTED,
             ["s3://bucket/model/model-mtp.safetensors"],
         )
+
+
+def test_reinit_for_retry_restores_custom_op_counters(monkeypatch):
+    from collections import Counter
+
+    config = _context_config(load_device="cpu")
+    config.compilation_config = SimpleNamespace(
+        enabled_custom_ops=Counter(),
+        disabled_custom_ops=Counter({"rms_norm": 193, "rotary_embedding": 1}),
+    )
+    adapter = VllmAdapter(config, _model_config())
+    adapter.snapshot_custom_op_counters()
+    # A strategy may touch the counters before it fails.
+    config.compilation_config.disabled_custom_ops["unquantized_fused_moe"] += 48
+
+    rebuilt = nn.Module()
+
+    def initialize_model(*, vllm_config, model_config):
+        # The rebuild re-instantiates plain layers but not process-memoized
+        # ones (rotary_embedding), which is what makes a bare clear wrong.
+        vllm_config.compilation_config.disabled_custom_ops["rms_norm"] += 193
+        return rebuilt
+
+    for name in ("vllm", "vllm.model_executor", "vllm.model_executor.model_loader"):
+        if name not in sys.modules:
+            monkeypatch.setitem(sys.modules, name, ModuleType(name))
+    monkeypatch.setitem(
+        sys.modules,
+        "vllm.model_executor.model_loader.utils",
+        SimpleNamespace(initialize_model=initialize_model),
+    )
+
+    result = adapter.reinit_for_retry(
+        LoadResult(value=nn.Module(), model=nn.Module(), publishable=True)
+    )
+
+    assert result.model is rebuilt
+    assert config.compilation_config.disabled_custom_ops == Counter(
+        {"rms_norm": 193, "rotary_embedding": 1}
+    )
+    assert config.compilation_config.enabled_custom_ops == Counter()

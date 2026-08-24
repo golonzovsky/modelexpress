@@ -99,6 +99,9 @@ class WorkerServiceServicer(p2p_pb2_grpc.WorkerServiceServicer):
                 self._artifact_sources.pop(mx_source_id, None)
 
     def GetTensorManifest(self, request, context):
+        artifact_response = self._artifact_discovery_response(request)
+        if artifact_response is not None:
+            return artifact_response
         self._validate_tensor_source(
             request.mx_source_id,
             request.worker_id if request.HasField("worker_id") else None,
@@ -117,6 +120,43 @@ class WorkerServiceServicer(p2p_pb2_grpc.WorkerServiceServicer):
         logger.info(
             f"GetTensorManifest served: {len(self._tensor_protos)} tensors, "
             f"{response.ByteSize()} bytes (worker_rank={self._worker_rank})"
+        )
+        return response
+
+    def _artifact_discovery_response(
+        self,
+        request: p2p_pb2.GetTensorManifestRequest,
+    ) -> p2p_pb2.GetTensorManifestResponse | None:
+        """Answer GetTensorManifest for a registered artifact source id.
+
+        Decentralized (k8s-service) artifact discovery has no central
+        registry: targets locate artifact sources through the same
+        Service-routed GetTensorManifest they use for tensors, keyed by
+        the artifact's own mx_source_id. Echo the requested id with an
+        empty tensor list and this worker's endpoints; the manifest
+        itself is then fetched via GetArtifactManifestHeader, which
+        resolves per-artifact ids. Unknown ids fall through to the
+        tensor-source validation and keep failing FAILED_PRECONDITION.
+        """
+        requested = request.mx_source_id
+        if not requested or requested == self._mx_source_id:
+            return None
+        with self._artifact_lock:
+            if requested not in self._artifact_sources:
+                return None
+        response = p2p_pb2.GetTensorManifestResponse(
+            tensors=[],
+            mx_source_id=requested,
+            metadata_endpoint=self._metadata_endpoint,
+            agent_name=self._agent_name,
+            worker_rank=self._worker_rank,
+            accelerator=self._accelerator,
+        )
+        if self._worker_id:
+            response.worker_id = self._worker_id
+        logger.info(
+            f"GetTensorManifest served artifact discovery for "
+            f"mx_source_id={requested} (worker_rank={self._worker_rank})"
         )
         return response
 

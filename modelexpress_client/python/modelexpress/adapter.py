@@ -171,6 +171,10 @@ class EngineAdapter:
         """
         ...
 
+    def snapshot_custom_op_counters(self) -> None:
+        """Record engine op counters after the initial build so reinit_for_retry can restore them."""
+        return None
+
     def get_unique_id(self) -> str:
         """Return a best-effort unique id for engines without custom identity."""
         if torch.distributed.is_available() and torch.distributed.is_initialized():

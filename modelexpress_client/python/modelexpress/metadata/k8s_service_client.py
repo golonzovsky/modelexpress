@@ -243,11 +243,20 @@ class MxK8sServiceClient(MxClientBase):
                     worker_rank=resp.worker_rank,
                     metadata_endpoint=resp.metadata_endpoint,
                     agent_name=resp.agent_name,
-                    tensor_source=tensor_source_metadata(resp.tensors),
                     status=p2p_pb2.SOURCE_STATUS_READY,
                     worker_grpc_endpoint=endpoint,
                     accelerator=resp.accelerator,
                 )
+                if resp.tensors:
+                    worker.tensor_source.CopyFrom(tensor_source_metadata(resp.tensors))
+                else:
+                    # No tensors means artifact discovery (a tensor source
+                    # always carries tensors): mark the payload as an
+                    # artifact source so discover_artifact_source accepts
+                    # it. artifact_id stays empty; the follow-up
+                    # GetArtifactManifestHeader resolves it through the
+                    # worker's single-manifest fallback.
+                    worker.artifact_source.CopyFrom(p2p_pb2.ArtifactSourceMetadata())
                 logger.info(
                     "MxK8sServiceClient.get_metadata: fetched "
                     "manifest from %s (mx_source_id=%s, rank=%d, "

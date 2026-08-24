@@ -178,9 +178,32 @@ class VllmAdapter(EngineAdapter):
         self.load_config = vllm_config.load_config
         self.target_device = self._resolve_target_device()
         self.accelerator_backend = accelerator_backend_for(self.target_device)
+        self._custom_op_counters: dict[str, dict[str, int]] | None = None
 
     def build_identity(self):
         return build_source_identity(self.vllm_config, self.model_config)
+
+    def snapshot_custom_op_counters(self) -> None:
+        """Record the op counters right after the initial model build.
+
+        CustomOp construction increments compilation_config's
+        enabled/disabled_custom_ops, and vLLM releases up to 0.28 hash them
+        into the compile-cache key (vllm-project/vllm#53378 stops that on
+        main). A strategy-retry rebuild desyncs them from a single-build
+        peer in both directions: fresh layers double-count while
+        process-memoized ones (rotary embeddings via get_rope's cache)
+        never re-count. reinit_for_retry restores this snapshot after
+        rebuilding so identical replicas keep sharing compile caches.
+        """
+        self._custom_op_counters = self._read_custom_op_counters()
+
+    def _read_custom_op_counters(self) -> dict[str, dict[str, int]]:
+        counters = {}
+        for attr in ("enabled_custom_ops", "disabled_custom_ops"):
+            counter = getattr(self.vllm_config.compilation_config, attr, None)
+            if counter is not None and hasattr(counter, "clear"):
+                counters[attr] = dict(counter)
+        return counters
 
     def get_worker_rank(self) -> int:
         return _get_vllm_worker_rank(self.vllm_config, self.target_device)
@@ -359,6 +382,11 @@ class VllmAdapter(EngineAdapter):
         # Unregister before dropping the model: its registrations identify it,
         # and clearing them frees its parameters before the rebuild allocates.
         self._unregister_model_layers(stale_model)
+        # See snapshot_custom_op_counters; fall back to the entry state for
+        # callers that skipped the loader-level snapshot.
+        counter_snapshots = self._custom_op_counters
+        if counter_snapshots is None:
+            counter_snapshots = self._read_custom_op_counters()
         del stale_value
         del stale_model
         self.accelerator_backend.empty_cache()
@@ -371,6 +399,10 @@ class VllmAdapter(EngineAdapter):
                 vllm_config=self.vllm_config,
                 model_config=self.model_config,
             )
+        for attr, snapshot in counter_snapshots.items():
+            counter = getattr(self.vllm_config.compilation_config, attr)
+            counter.clear()
+            counter.update(snapshot)
         return LoadResult(value=model, model=model, publishable=result.publishable)
 
     def _process_weights_after_loading(

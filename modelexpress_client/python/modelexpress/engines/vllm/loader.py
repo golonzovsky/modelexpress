@@ -115,6 +115,7 @@ class MxModelLoader(BaseModelLoader):
                         prefix=prefix,
                     )
 
+                ctx.adapter.snapshot_custom_op_counters()
                 model = LoadStrategyChain.run(model, ctx)
 
                 if ctx.p2p_enabled:
